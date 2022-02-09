@@ -681,14 +681,15 @@ static PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
     return NULL;
   }
 
-  if (!PyBytes_Check(source_code)) {
-    PyErr_SetString(PyExc_TypeError, "First argument to parse must be bytes");
+  Py_buffer source_view;
+  if (PyObject_GetBuffer(source_code, &source_view, PyBUF_SIMPLE)) {
     return NULL;
   }
 
   const TSTree *old_tree = NULL;
   if (old_tree_arg) {
     if (!PyObject_IsInstance(old_tree_arg, (PyObject *)&tree_type)) {
+      PyBuffer_Release(&source_view);
       PyErr_SetString(PyExc_TypeError, "Second argument to parse must be a Tree");
       return NULL;
     }
@@ -696,9 +697,10 @@ static PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
     old_tree = ((Tree *)old_tree_arg)->tree;
   }
 
-  size_t length = PyBytes_Size(source_code);
-  char *source_bytes = PyBytes_AsString(source_code);
+  const char *source_bytes = (const char *)source_view.buf;
+  size_t length = source_view.len;
   TSTree *new_tree = ts_parser_parse_string(self->parser, old_tree, source_bytes, length);
+  PyBuffer_Release(&source_view);
 
   if (!new_tree) {
     PyErr_SetString(PyExc_ValueError, "Parsing failed");
@@ -978,7 +980,7 @@ static bool satisfies_text_predicates(Query *query, TSQueryMatch match, Tree *tr
     Py_XDECREF(node2);
     Py_XDECREF(node1_text);
     Py_XDECREF(node2_text);
-    return NULL;
+    return false;
 }
 
 static PyObject *query_captures(Query *self, PyObject *args, PyObject *kwargs) {
