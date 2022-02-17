@@ -63,6 +63,11 @@ typedef struct {
   TSQueryCapture capture;
 } QueryCapture;
 
+typedef struct {
+  PyObject_HEAD
+  TSRange range;
+} Range;
+
 static TSTreeCursor default_cursor = {0};
 static TSQueryCursor *query_cursor = NULL;
 static PyObject *re_compile = NULL;
@@ -163,8 +168,48 @@ static PyObject *node_chield_by_field_name(Node *self, PyObject *args) {
   return node_new_internal(child, self->tree);
 }
 
+
 static PyObject *node_get_id(Node *self, void *payload) {
   return PyLong_FromVoidPtr((void *)self->node.id);
+}
+
+static PyObject *node_children_by_field_id_internal(Node *self, TSFieldId field_id) {
+  PyObject *result = PyList_New(0);
+
+  ts_tree_cursor_reset(&default_cursor, self->node);
+  int ok = ts_tree_cursor_goto_first_child(&default_cursor);
+  while (ok) {
+    if (ts_tree_cursor_current_field_id(&default_cursor) == field_id) {
+      TSNode tsnode = ts_tree_cursor_current_node(&default_cursor);
+      PyObject *node = node_new_internal(tsnode, self->tree);
+      PyList_Append(result, node);
+      Py_XDECREF(node);
+    }
+    ok = ts_tree_cursor_goto_next_sibling(&default_cursor);
+  }
+
+  return result;
+}
+
+static PyObject *node_children_by_field_id(Node *self, PyObject *args) {
+  TSFieldId field_id;
+  if (!PyArg_ParseTuple(args, "H", &field_id)) {
+    return NULL;
+  }
+
+  return node_children_by_field_id_internal(self, field_id);
+}
+
+static PyObject *node_children_by_field_name(Node *self, PyObject *args) {
+  char *name;
+  Py_ssize_t length;
+  if (!PyArg_ParseTuple(args, "s#", &name, &length)) {
+    return NULL;
+  }
+
+  const TSLanguage *lang = ts_tree_language(((Tree*)self->tree)->tree);
+  TSFieldId field_id = ts_language_field_id_for_name(lang, name, length);
+  return node_children_by_field_id_internal(self, field_id);
 }
 
 static PyObject *node_get_type(Node *self, void *payload) {
@@ -358,6 +403,20 @@ static PyMethodDef node_methods[] = {
     .ml_doc = "child_by_field_name(name)\n--\n\n\
                Get child for the given field name.",
   },
+  {
+    .ml_name = "children_by_field_id",
+    .ml_meth = (PyCFunction)node_children_by_field_id,
+    .ml_flags = METH_VARARGS,
+    .ml_doc = "children_by_field_id(id)\n--\n\n\
+               Get list of child nodes by the field id.",
+  },
+  {
+    .ml_name = "children_by_field_name",
+    .ml_meth = (PyCFunction)node_children_by_field_name,
+    .ml_flags = METH_VARARGS,
+    .ml_doc = "children_by_field_name(name)\n--\n\n\
+               Get list of child nodes by the field name.",
+  },
   {NULL},
 };
 
@@ -414,6 +473,9 @@ static bool node_is_instance(PyObject *self) {
 }
 
 // Tree
+
+static PyObject *range_new_internal(TSRange range);
+static PyTypeObject tree_type;
 
 static void tree_dealloc(Tree *self) {
   ts_tree_delete(self->tree);
@@ -486,6 +548,37 @@ static PyObject *tree_edit(Tree *self, PyObject *args, PyObject *kwargs) {
   Py_RETURN_NONE;
 }
 
+static PyObject *tree_get_changed_ranges(Tree *self, PyObject *args, PyObject *kwargs) {
+  Tree *new_tree = NULL;
+  char *keywords[] = {"new_tree", NULL};
+  int ok = PyArg_ParseTupleAndKeywords(
+    args,
+    kwargs,
+    "O",
+    keywords,
+    (PyObject **)&new_tree
+  );
+  if (!ok) return NULL;
+
+  if (!PyObject_IsInstance((PyObject *)new_tree, (PyObject *)&tree_type)) {
+    PyErr_SetString(PyExc_TypeError, "First argument to get_changed_ranges must be a Tree");
+    return NULL;
+  }
+
+  uint32_t length = 0;
+  TSRange *ranges = ts_tree_get_changed_ranges(self->tree, new_tree->tree, &length);
+
+  PyObject *result = PyList_New(length);
+  if (!result) return NULL;
+  for (unsigned i=0; i < length; i++) {
+    PyObject *range = range_new_internal(ranges[i]);
+    PyList_SetItem(result, i, range);
+  }
+
+  free(ranges);
+  return result;
+}
+
 static PyMethodDef tree_methods[] = {
   {
     .ml_name = "walk",
@@ -501,6 +594,13 @@ static PyMethodDef tree_methods[] = {
     .ml_doc = "edit(start_byte, old_end_byte, new_end_byte,\
                start_point, old_end_point, new_end_point)\n--\n\n\
                Edit the syntax tree.",
+  },
+  {
+    .ml_name = "get_changed_ranges",
+    .ml_meth = (PyCFunction)tree_get_changed_ranges,
+    .ml_flags = METH_KEYWORDS|METH_VARARGS,
+    .ml_doc = "get_changed_ranges(new_tree)\n--\n\n\
+               Compare old edited tree to new tree and return changed ranges.",
   },
   {NULL},
 };
@@ -1229,6 +1329,94 @@ static PyObject *query_new_internal(
     return NULL;
 }
 
+// Range
+
+static PyTypeObject range_type;
+
+static void range_dealloc(Range *self) {
+  Py_TYPE(self)->tp_free(self);
+}
+
+static PyObject *range_repr(Range *self) {
+  const char *format_string = "<Range start_point=(%u, %u), start_byte=%u, end_point=(%u, %u), end_byte=%u>";
+  return PyUnicode_FromFormat(
+    format_string,
+    self->range.start_point.row,
+    self->range.start_point.column,
+    self->range.start_byte,
+    self->range.end_point.row,
+    self->range.end_point.column,
+    self->range.end_byte
+ );
+}
+
+static bool range_is_instance(PyObject *self) {
+  return PyObject_IsInstance(self, (PyObject *)&range_type);
+}
+
+static PyObject *range_compare(Range *self, Range *other, int op) {
+  if (range_is_instance((PyObject *)other)) {
+    bool result = (
+      (self->range.start_point.row == other->range.start_point.row) &&
+      (self->range.start_point.column == other->range.start_point.column) &&
+      (self->range.start_byte == other->range.start_byte) &&
+      (self->range.end_point.row == other->range.end_point.row) &&
+      (self->range.end_point.column == other->range.end_point.column) &&
+      (self->range.end_byte == other->range.end_byte)
+    );
+    switch (op) {
+      case Py_EQ: return PyBool_FromLong(result);
+      case Py_NE: return PyBool_FromLong(!result);
+      default: Py_RETURN_FALSE;
+    }
+  } else {
+    Py_RETURN_FALSE;
+  }
+}
+
+static PyObject *range_get_start_point(Range *self, void *payload) {
+  return point_new(self->range.start_point);
+}
+
+static PyObject *range_get_end_point(Range *self, void *payload) {
+  return point_new(self->range.end_point);
+}
+
+static PyObject *range_get_start_byte(Range *self, void *payload) {
+  return PyLong_FromSize_t((size_t)(self->range.start_byte));
+}
+
+static PyObject *range_get_end_byte(Range *self, void *payload) {
+  return PyLong_FromSize_t((size_t)(self->range.end_byte));
+}
+
+static PyGetSetDef range_accessors[] = {
+  {"start_point", (getter)range_get_start_point, NULL, "The start point of this range", NULL},
+  {"start_byte", (getter)range_get_start_byte, NULL, "The start byte of this range", NULL},
+  {"end_point", (getter)range_get_end_point, NULL, "The end point of this range", NULL},
+  {"end_byte", (getter)range_get_end_byte, NULL, "The end byte of this range", NULL},
+  {NULL}
+};
+
+static PyTypeObject range_type = {
+  PyVarObject_HEAD_INIT(NULL, 0)
+  .tp_name = "tree_sitter.Range",
+  .tp_doc = "A range within a document.",
+  .tp_basicsize = sizeof(Range),
+  .tp_itemsize = 0,
+  .tp_flags = Py_TPFLAGS_DEFAULT,
+  .tp_dealloc = (destructor)range_dealloc,
+  .tp_repr = (reprfunc)range_repr,
+  .tp_richcompare = (richcmpfunc)range_compare,
+  .tp_getset = range_accessors,
+};
+
+static PyObject *range_new_internal(TSRange range) {
+  Range *self = (Range *)range_type.tp_alloc(&range_type, 0);
+  if (self != NULL) self->range = range;
+  return (PyObject *)self;
+}
+
 // Module
 
 static PyObject *language_field_id_for_name(PyObject *self, PyObject *args) {
@@ -1327,6 +1515,10 @@ PyMODINIT_FUNC PyInit_binding(void) {
   if (PyType_Ready(&query_type) < 0) return NULL;
   Py_INCREF(&query_type);
   PyModule_AddObject(module, "Query", (PyObject *)&query_type);
+
+  if (PyType_Ready(&range_type) < 0) return NULL;
+  Py_INCREF(&range_type);
+  PyModule_AddObject(module, "Range", (PyObject *)&range_type);
 
   PyObject *re_module = PyImport_ImportModule("re");
   if (re_module == NULL) return NULL;
