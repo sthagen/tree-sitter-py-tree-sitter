@@ -256,18 +256,53 @@ static PyObject *node_get_children(Node *self, void *payload) {
 
   long length = (long)ts_node_child_count(self->node);
   PyObject *result = PyList_New(length);
+  if (result == NULL) {
+    return NULL;
+  }
   if (length > 0) {
     ts_tree_cursor_reset(&default_cursor, self->node);
     ts_tree_cursor_goto_first_child(&default_cursor);
     int i = 0;
     do {
       TSNode child = ts_tree_cursor_current_node(&default_cursor);
-      PyList_SetItem(result, i, node_new_internal(child, self->tree));
+      if (PyList_SetItem(result, i, node_new_internal(child, self->tree))) {
+        Py_DECREF(result);
+        return NULL;
+      }
       i++;
     } while (ts_tree_cursor_goto_next_sibling(&default_cursor));
   }
   Py_INCREF(result);
   self->children = result;
+  return result;
+}
+
+static PyObject *node_get_named_children(Node *self, void *payload) {
+  PyObject* children = node_get_children(self, payload);
+  if (children == NULL) {
+    return NULL;
+  }
+  // children is retained by self->children
+  Py_DECREF(children);
+
+  long named_count = (long)ts_node_named_child_count(self->node);
+  PyObject *result = PyList_New(named_count);
+  if (result == NULL) {
+    return NULL;
+  }
+
+  long length = (long)ts_node_child_count(self->node);
+  int j = 0;
+  for (int i = 0; i < length; i++) {
+    PyObject *child = PyList_GetItem(self->children, i);
+    if (ts_node_is_named(((Node *)child)->node)) {
+      Py_INCREF(child);
+      if (PyList_SetItem(result, j++, child)) {
+        Py_DECREF(result);
+        return NULL;
+      }
+    }
+  }
   return result;
 }
 
@@ -433,6 +468,7 @@ static PyGetSetDef node_accessors[] = {
   {"end_point", (getter)node_get_end_point, NULL, "The node's end point", NULL},
   {"children", (getter)node_get_children, NULL, "The node's children", NULL},
   {"child_count", (getter)node_get_child_count, NULL, "The number of children for a node", NULL},
+  {"named_children", (getter)node_get_named_children, NULL, "The node's named children", NULL},
   {"named_child_count", (getter)node_get_named_child_count, NULL, "The number of named children for a node", NULL},
   {"next_sibling", (getter)node_get_next_sibling, NULL, "The node's next sibling", NULL},
   {"prev_sibling", (getter)node_get_prev_sibling, NULL, "The node's previous sibling", NULL},
@@ -793,42 +829,116 @@ static void parser_dealloc(Parser *self) {
   Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
-static PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
-  PyObject *source_code = NULL;
-  PyObject *old_tree_arg = NULL;
-  int keep_text = 1;
-  static char *keywords[] = {"source", "old_tree", "keep_text", NULL};
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|Op:parse", keywords, &source_code, &old_tree_arg, &keep_text)) {
+typedef struct {
+  PyObject *read_cb;
+  PyObject *previous_return_value;
+} ReadWrapperPayload;
+
+static const char* parser_read_wrapper(void *payload, uint32_t byte_offset, TSPoint position, uint32_t* bytes_read) {
+  ReadWrapperPayload *wrapper_payload = payload;
+  PyObject *read_cb = wrapper_payload->read_cb;
+
+  // We assume that the parser only needs the return value until the next time
+  // this function is called or when ts_parser_parse() returns. We store the
+  // return value from the callable in wrapper_payload->previous_return_value so
+  // that its reference count will be decremented either during the next call to
+  // this wrapper or after ts_parser_parse() has returned.
+  Py_XDECREF(wrapper_payload->previous_return_value);
+  wrapper_payload->previous_return_value = NULL;
+
+  // Form arguments to callable.
+  PyObject *byte_offset_obj = PyLong_FromSize_t((size_t) byte_offset);
+  PyObject *position_obj = point_new(position);
+  if (!position_obj || !byte_offset_obj) {
+    *bytes_read = 0;
     return NULL;
   }
 
-  Py_buffer source_view;
-  if (PyObject_GetBuffer(source_code, &source_view, PyBUF_SIMPLE)) {
+  PyObject *args = PyTuple_Pack(2, byte_offset_obj, position_obj);
+  Py_XDECREF(byte_offset_obj);
+  Py_XDECREF(position_obj);
+
+  // Call callable.
+  PyObject* rv = PyObject_Call(read_cb, args, NULL);
+  Py_XDECREF(args);
+
+  // If error or None returned, we've done parsing.
+  if(!rv || (rv == Py_None)) {
+    Py_XDECREF(rv);
+    *bytes_read = 0;
+    return NULL;
+  }
+
+  // If something other than None is returned, it must be a bytes object.
+  if(!PyBytes_Check(rv)) {
+    Py_XDECREF(rv);
+    PyErr_SetString(PyExc_TypeError, "Read callable must return None or byte buffer type");
+    *bytes_read = 0;
+    return NULL;
+  }
+
+  // Store return value in payload so its reference count can be decremented and
+  // return string representation of bytes.
+  wrapper_payload->previous_return_value = rv;
+  *bytes_read = PyBytes_Size(rv);
+  return PyBytes_AsString(rv);
+}
+
+static PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
+  PyObject *source_or_callback = NULL;
+  PyObject *old_tree_arg = NULL;
+  int keep_text = 1;
+  static char *keywords[] = {"", "old_tree", "keep_text", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|Op:parse", keywords, &source_or_callback, &old_tree_arg, &keep_text)) {
     return NULL;
   }
 
   const TSTree *old_tree = NULL;
   if (old_tree_arg) {
     if (!PyObject_IsInstance(old_tree_arg, (PyObject *)&tree_type)) {
-      PyBuffer_Release(&source_view);
       PyErr_SetString(PyExc_TypeError, "Second argument to parse must be a Tree");
       return NULL;
     }
-
     old_tree = ((Tree *)old_tree_arg)->tree;
   }
 
-  const char *source_bytes = (const char *)source_view.buf;
-  size_t length = source_view.len;
-  TSTree *new_tree = ts_parser_parse_string(self->parser, old_tree, source_bytes, length);
-  PyBuffer_Release(&source_view);
+  TSTree *new_tree = NULL;
+  Py_buffer source_view;
+  if (! PyObject_GetBuffer(source_or_callback, &source_view, PyBUF_SIMPLE)) {
+    // parse a buffer
+    const char *source_bytes = (const char *)source_view.buf;
+    size_t length = source_view.len;
+    new_tree = ts_parser_parse_string(self->parser, old_tree, source_bytes, length);
+    PyBuffer_Release(&source_view);
+  } else if (PyCallable_Check(source_or_callback)) {
+    PyErr_Clear(); // clear the GetBuffer error
+    // parse a callable
+    ReadWrapperPayload payload = {
+      .read_cb = source_or_callback,
+      .previous_return_value = NULL,
+    };
+    TSInput input = {
+      .payload = &payload,
+      .read = parser_read_wrapper,
+      .encoding = TSInputEncodingUTF8,
+    };
+    new_tree = ts_parser_parse(self->parser, old_tree, input);
+    Py_XDECREF(payload.previous_return_value);
+
+    // don't allow tree_new_internal to keep the source text
+    source_or_callback = Py_None;
+    keep_text = 0;
+  } else {
+    PyErr_SetString(PyExc_TypeError, "First argument byte buffer type or callable");
+    return NULL;
+  }
 
   if (!new_tree) {
     PyErr_SetString(PyExc_ValueError, "Parsing failed");
     return NULL;
   }
 
-  return tree_new_internal(new_tree, source_code, keep_text);
+  return tree_new_internal(new_tree, source_or_callback, keep_text);
 }
 
 static PyObject *parser_set_language(Parser *self, PyObject *arg) {

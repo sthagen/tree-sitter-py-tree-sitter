@@ -49,6 +49,32 @@ class TestParser(TestCase):
             ),
         )
 
+    def test_read_callback(self):
+        parser = Parser()
+        parser.set_language(PYTHON)
+        source_lines = ["def foo():\n", "  bar()"]
+
+        def read_callback(byte_offset, point):
+            row, column = point
+            if row >= len(source_lines):
+                return None
+            if column >= len(source_lines[row]):
+                return None
+            return source_lines[row][column:].encode("utf8")
+
+        tree = parser.parse(read_callback)
+        self.assertEqual(
+            tree.root_node.sexp(),
+            trim(
+                """(module (function_definition
+                name: (identifier)
+                parameters: (parameters)
+                body: (block (expression_statement (call
+                    function: (identifier)
+                    arguments: (argument_list))))))"""
+            ),
+        )
+
     def test_multibyte_characters(self):
         parser = Parser()
         parser.set_language(JAVASCRIPT)
@@ -72,6 +98,27 @@ class TestParser(TestCase):
         parser.parse(b'test')
         parser.parse(memoryview(b'test'))
         parser.parse(bytearray(b'test'))
+
+    def test_multibyte_characters_via_read_callback(self):
+        parser = Parser()
+        parser.set_language(JAVASCRIPT)
+        source_code = bytes("'😎' && '🐍'", "utf8")
+
+        def read(byte_position, point):
+            return source_code[byte_position:byte_position+1]
+
+        tree = parser.parse(read)
+        root_node = tree.root_node
+        statement_node = root_node.children[0]
+        binary_node = statement_node.children[0]
+        snake_node = binary_node.children[2]
+
+        self.assertEqual(binary_node.type, "binary_expression")
+        self.assertEqual(snake_node.type, "string")
+        self.assertEqual(
+            source_code[snake_node.start_byte:snake_node.end_byte].decode("utf8"),
+            "'🐍'",
+        )
 
 
 class TestNode(TestCase):
@@ -195,6 +242,8 @@ class TestNode(TestCase):
         self.assertEqual(list_node.parent,
                          exp_stmt_node)
 
+        named_children = list_node.named_children
+
         open_delim_node = list_node.children[0]
         self.assertEqual(open_delim_node.type, "[")
         self.assertEqual(open_delim_node.start_byte, 0)
@@ -209,6 +258,8 @@ class TestNode(TestCase):
                          open_delim_node.next_named_sibling)
         self.assertEqual(first_num_node.parent,
                          list_node)
+        self.assertEqual(named_children[0],
+                         first_num_node)
 
         first_comma_node = list_node.children[2]
         self.assertEqual(first_comma_node,
@@ -227,6 +278,8 @@ class TestNode(TestCase):
                          second_num_node.prev_named_sibling)
         self.assertEqual(second_num_node.parent,
                          list_node)
+        self.assertEqual(named_children[1],
+                         second_num_node)
 
         second_comma_node = list_node.children[4]
         self.assertEqual(second_comma_node,
@@ -245,6 +298,8 @@ class TestNode(TestCase):
                          third_num_node.prev_named_sibling)
         self.assertEqual(third_num_node.parent,
                          list_node)
+        self.assertEqual(named_children[2],
+                         third_num_node)
 
         close_delim_node = list_node.children[6]
         self.assertEqual(close_delim_node.type, "]")
