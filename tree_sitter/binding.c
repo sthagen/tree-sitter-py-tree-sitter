@@ -406,7 +406,9 @@ static PyObject *node_get_text(Node *self, void *payload) {
                     "PyObject_GetItem failed");
     return NULL;
   }
-  return PyBytes_FromObject(node_slice);
+  PyObject *result = PyBytes_FromObject(node_slice);
+  Py_DECREF(node_slice);
+  return result;
 }
 
 static PyMethodDef node_methods[] = {
@@ -1219,22 +1221,28 @@ static PyObject *query_captures(Query *self, PyObject *args, PyObject *kwargs) {
     "node",
     "start_point",
     "end_point",
+    "start_byte",
+    "end_byte",
     NULL,
   };
 
   Node *node = NULL;
-  unsigned start_row = 0, start_column = 0, end_row = 0, end_column = 0;
+  TSPoint start_point = {.row=0, .column=0};
+  TSPoint end_point   = {.row=UINT32_MAX, .column=UINT32_MAX};
+  unsigned start_byte = 0, end_byte = UINT32_MAX;
 
   int ok = PyArg_ParseTupleAndKeywords(
     args,
     kwargs,
-    "O|(II)(II)",
+    "O|(II)(II)II",
     keywords,
     (PyObject **)&node,
-    &start_row,
-    &start_column,
-    &end_row,
-    &end_column
+    &start_point.row,
+    &start_point.column,
+    &end_point.row,
+    &end_point.column,
+    &start_byte,
+    &end_byte
   );
   if (!ok) return NULL;
 
@@ -1244,6 +1252,8 @@ static PyObject *query_captures(Query *self, PyObject *args, PyObject *kwargs) {
   }
 
   if (!query_cursor) query_cursor = ts_query_cursor_new();
+  ts_query_cursor_set_byte_range(query_cursor, start_byte, end_byte);
+  ts_query_cursor_set_point_range(query_cursor, start_point, end_point);
   ts_query_cursor_exec(query_cursor, self->query, node->node);
 
   QueryCapture *capture = NULL;
