@@ -69,6 +69,13 @@ typedef struct {
 } Range;
 
 typedef struct {
+    PyObject_HEAD
+    TSLookaheadIterator *lookahead_iterator;
+} LookaheadIterator;
+
+typedef LookaheadIterator LookaheadNamesIterator;
+
+typedef struct {
     TSTreeCursor default_cursor;
     TSQueryCursor *query_cursor;
     PyObject *re_compile;
@@ -83,6 +90,8 @@ typedef struct {
     PyTypeObject *capture_eq_capture_type;
     PyTypeObject *capture_eq_string_type;
     PyTypeObject *capture_match_string_type;
+    PyTypeObject *lookahead_iterator_type;
+    PyTypeObject *lookahead_names_iterator_type;
 } ModuleState;
 
 #if PY_VERSION_HEX < 0x030900f0
@@ -114,6 +123,11 @@ static PyObject *point_new(TSPoint point) {
 
 static PyObject *node_new_internal(ModuleState *state, TSNode node, PyObject *tree);
 static PyObject *tree_cursor_new_internal(ModuleState *state, TSNode node, PyObject *tree);
+static PyObject *range_new_internal(ModuleState *state, TSRange range);
+static PyObject *lookahead_iterator_new_internal(ModuleState *state,
+                                                 TSLookaheadIterator *lookahead_iterator);
+static PyObject *lookahead_names_iterator_new_internal(ModuleState *state,
+                                                       TSLookaheadIterator *lookahead_iterator);
 
 static void node_dealloc(Node *self) {
     Py_XDECREF(self->children);
@@ -164,6 +178,80 @@ static PyObject *node_walk(Node *self, PyObject *args) {
     return tree_cursor_new_internal(state, self->node, self->tree);
 }
 
+static PyObject *node_edit(Node *self, PyObject *args, PyObject *kwargs) {
+    unsigned start_byte, start_row, start_column;
+    unsigned old_end_byte, old_end_row, old_end_column;
+    unsigned new_end_byte, new_end_row, new_end_column;
+
+    char *keywords[] = {
+        "start_byte",    "old_end_byte",  "new_end_byte", "start_point",
+        "old_end_point", "new_end_point", NULL,
+    };
+
+    int ok = PyArg_ParseTupleAndKeywords(
+        args, kwargs, "III(II)(II)(II)", keywords, &start_byte, &old_end_byte, &new_end_byte,
+        &start_row, &start_column, &old_end_row, &old_end_column, &new_end_row, &new_end_column);
+
+    if (!ok) {
+        Py_RETURN_NONE;
+    }
+
+    TSInputEdit edit = {
+        .start_byte = start_byte,
+        .old_end_byte = old_end_byte,
+        .new_end_byte = new_end_byte,
+        .start_point =
+            {
+                .row = start_row,
+                .column = start_column,
+            },
+        .old_end_point =
+            {
+                .row = old_end_row,
+                .column = old_end_column,
+            },
+        .new_end_point =
+            {
+                .row = new_end_row,
+                .column = new_end_column,
+            },
+    };
+
+    ts_node_edit(&self->node, &edit);
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *node_child(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    long index;
+    if (!PyArg_ParseTuple(args, "l", &index)) {
+        return NULL;
+    }
+    if (index < 0) {
+        PyErr_SetString(PyExc_ValueError, "Index must be positive");
+        return NULL;
+    }
+
+    TSNode child = ts_node_child(self->node, (uint32_t)index);
+    return node_new_internal(state, child, self->tree);
+}
+
+static PyObject *node_named_child(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    long index;
+    if (!PyArg_ParseTuple(args, "l", &index)) {
+        return NULL;
+    }
+    if (index < 0) {
+        PyErr_SetString(PyExc_ValueError, "Index must be positive");
+        return NULL;
+    }
+
+    TSNode child = ts_node_named_child(self->node, (uint32_t)index);
+    return node_new_internal(state, child, self->tree);
+}
+
 static PyObject *node_child_by_field_id(Node *self, PyObject *args) {
     ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
     TSFieldId field_id;
@@ -189,10 +277,6 @@ static PyObject *node_child_by_field_name(Node *self, PyObject *args) {
         Py_RETURN_NONE;
     }
     return node_new_internal(state, child, self->tree);
-}
-
-static PyObject *node_get_id(Node *self, void *payload) {
-    return PyLong_FromVoidPtr((void *)self->node.id);
 }
 
 static PyObject *node_children_by_field_id_internal(Node *self, TSFieldId field_id) {
@@ -249,16 +333,122 @@ static PyObject *node_field_name_for_child(Node *self, PyObject *args) {
     return PyUnicode_FromString(field_name);
 }
 
+static PyObject *node_descendant_for_byte_range(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    uint32_t start_byte, end_byte;
+    if (!PyArg_ParseTuple(args, "II", &start_byte, &end_byte)) {
+        return NULL;
+    }
+    TSNode descendant = ts_node_descendant_for_byte_range(self->node, start_byte, end_byte);
+    if (ts_node_is_null(descendant)) {
+        Py_RETURN_NONE;
+    }
+    return node_new_internal(state, descendant, self->tree);
+}
+
+static PyObject *node_named_descendant_for_byte_range(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    uint32_t start_byte, end_byte;
+    if (!PyArg_ParseTuple(args, "II", &start_byte, &end_byte)) {
+        return NULL;
+    }
+    TSNode descendant = ts_node_named_descendant_for_byte_range(self->node, start_byte, end_byte);
+    if (ts_node_is_null(descendant)) {
+        Py_RETURN_NONE;
+    }
+    return node_new_internal(state, descendant, self->tree);
+}
+
+static PyObject *node_descendant_for_point_range(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+
+    if (!PyTuple_Check(args) || PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "Expected two tuples as arguments");
+        return NULL;
+    }
+
+    PyObject *start_point = PyTuple_GetItem(args, 0);
+    PyObject *end_point = PyTuple_GetItem(args, 1);
+
+    if (!PyTuple_Check(start_point) || !PyTuple_Check(end_point)) {
+        PyErr_SetString(PyExc_TypeError, "Both start_point and end_point must be tuples");
+        return NULL;
+    }
+
+    TSPoint start, end;
+    if (!PyArg_ParseTuple(start_point, "ii", &start.row, &start.column)) {
+        return NULL;
+    }
+    if (!PyArg_ParseTuple(end_point, "ii", &end.row, &end.column)) {
+        return NULL;
+    }
+
+    TSNode descendant = ts_node_descendant_for_point_range(self->node, start, end);
+    if (ts_node_is_null(descendant)) {
+        Py_RETURN_NONE;
+    }
+    return node_new_internal(state, descendant, self->tree);
+}
+
+static PyObject *node_named_descendant_for_point_range(Node *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+
+    if (!PyTuple_Check(args) || PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "Expected two tuples as arguments");
+        return NULL;
+    }
+
+    PyObject *start_point = PyTuple_GetItem(args, 0);
+    PyObject *end_point = PyTuple_GetItem(args, 1);
+
+    if (!PyTuple_Check(start_point) || !PyTuple_Check(end_point)) {
+        PyErr_SetString(PyExc_TypeError, "Both start_point and end_point must be tuples");
+        return NULL;
+    }
+
+    TSPoint start, end;
+    if (!PyArg_ParseTuple(start_point, "ii", &start.row, &start.column)) {
+        return NULL;
+    }
+    if (!PyArg_ParseTuple(end_point, "ii", &end.row, &end.column)) {
+        return NULL;
+    }
+
+    TSNode descendant = ts_node_named_descendant_for_point_range(self->node, start, end);
+    if (ts_node_is_null(descendant)) {
+        Py_RETURN_NONE;
+    }
+    return node_new_internal(state, descendant, self->tree);
+}
+
+static PyObject *node_get_id(Node *self, void *payload) {
+    return PyLong_FromVoidPtr((void *)self->node.id);
+}
+
+static PyObject *node_get_kind_id(Node *self, void *payload) {
+    TSSymbol kind_id = ts_node_symbol(self->node);
+    return PyLong_FromLong(kind_id);
+}
+
+static PyObject *node_get_grammar_id(Node *self, void *payload) {
+    TSSymbol grammar_id = ts_node_grammar_symbol(self->node);
+    return PyLong_FromLong(grammar_id);
+}
+
 static PyObject *node_get_type(Node *self, void *payload) {
     return PyUnicode_FromString(ts_node_type(self->node));
+}
+
+static PyObject *node_get_grammar_name(Node *self, void *payload) {
+    return PyUnicode_FromString(ts_node_grammar_type(self->node));
 }
 
 static PyObject *node_get_is_named(Node *self, void *payload) {
     return PyBool_FromLong(ts_node_is_named(self->node));
 }
 
-static PyObject *node_get_is_missing(Node *self, void *payload) {
-    return PyBool_FromLong(ts_node_is_missing(self->node));
+static PyObject *node_get_is_extra(Node *self, void *payload) {
+    return PyBool_FromLong(ts_node_is_extra(self->node));
 }
 
 static PyObject *node_get_has_changes(Node *self, void *payload) {
@@ -269,12 +459,59 @@ static PyObject *node_get_has_error(Node *self, void *payload) {
     return PyBool_FromLong(ts_node_has_error(self->node));
 }
 
+static PyObject *node_get_is_error(Node *self, void *payload) {
+    return PyBool_FromLong(ts_node_is_error(self->node));
+}
+
+static PyObject *node_get_parse_state(Node *self, void *payload) {
+    return PyLong_FromLong(ts_node_parse_state(self->node));
+}
+
+static PyObject *node_get_next_parse_state(Node *self, void *payload) {
+    return PyLong_FromLong(ts_node_next_parse_state(self->node));
+}
+
+static PyObject *node_get_is_missing(Node *self, void *payload) {
+    return PyBool_FromLong(ts_node_is_missing(self->node));
+}
+
 static PyObject *node_get_start_byte(Node *self, void *payload) {
     return PyLong_FromSize_t((size_t)ts_node_start_byte(self->node));
 }
 
 static PyObject *node_get_end_byte(Node *self, void *payload) {
     return PyLong_FromSize_t((size_t)ts_node_end_byte(self->node));
+}
+
+static PyObject *node_get_byte_range(Node *self, void *payload) {
+    PyObject *start_byte = PyLong_FromSize_t((size_t)ts_node_start_byte(self->node));
+    if (start_byte == NULL) {
+        return NULL;
+    }
+    PyObject *end_byte = PyLong_FromSize_t((size_t)ts_node_end_byte(self->node));
+    if (end_byte == NULL) {
+        Py_DECREF(start_byte);
+        return NULL;
+    }
+    PyObject *result = PyTuple_Pack(2, start_byte, end_byte);
+    Py_DECREF(start_byte);
+    Py_DECREF(end_byte);
+    return result;
+}
+
+static PyObject *node_get_range(Node *self, void *payload) {
+    uint32_t start_byte = ts_node_start_byte(self->node);
+    uint32_t end_byte = ts_node_end_byte(self->node);
+    TSPoint start_point = ts_node_start_point(self->node);
+    TSPoint end_point = ts_node_end_point(self->node);
+    TSRange range = {
+        .start_byte = start_byte,
+        .end_byte = end_byte,
+        .start_point = start_point,
+        .end_point = end_point,
+    };
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    return range_new_internal(state, range);
 }
 
 static PyObject *node_get_start_point(Node *self, void *payload) {
@@ -356,6 +593,15 @@ static PyObject *node_get_named_child_count(Node *self, void *payload) {
     return result;
 }
 
+static PyObject *node_get_parent(Node *self, void *payload) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    TSNode parent = ts_node_parent(self->node);
+    if (ts_node_is_null(parent)) {
+        Py_RETURN_NONE;
+    }
+    return node_new_internal(state, parent, self->tree);
+}
+
 static PyObject *node_get_next_sibling(Node *self, void *payload) {
     ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
     TSNode next_sibling = ts_node_next_sibling(self->node);
@@ -392,13 +638,10 @@ static PyObject *node_get_prev_named_sibling(Node *self, void *payload) {
     return node_new_internal(state, prev_named_sibling, self->tree);
 }
 
-static PyObject *node_get_parent(Node *self, void *payload) {
-    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
-    TSNode parent = ts_node_parent(self->node);
-    if (ts_node_is_null(parent)) {
-        Py_RETURN_NONE;
-    }
-    return node_new_internal(state, parent, self->tree);
+static PyObject *node_get_descendant_count(Node *self, void *payload) {
+    long length = (long)ts_node_descendant_count(self->node);
+    PyObject *result = PyLong_FromLong(length);
+    return result;
 }
 
 static PyObject *node_get_text(Node *self, void *payload) {
@@ -456,11 +699,33 @@ static PyMethodDef node_methods[] = {
                Get a tree cursor for walking the tree starting at this node.",
     },
     {
+        .ml_name = "edit",
+        .ml_meth = (PyCFunction)node_edit,
+        .ml_flags = METH_VARARGS | METH_KEYWORDS,
+        .ml_doc =
+            "edit(start_byte, old_end_byte, new_end_byte, start_point, old_end_point, new_end_point)\n--\n\n\
+			   Edit this node to keep it in-sync with source code that has been edited.",
+    },
+    {
         .ml_name = "sexp",
         .ml_meth = (PyCFunction)node_sexp,
         .ml_flags = METH_NOARGS,
         .ml_doc = "sexp()\n--\n\n\
                Get an S-expression representing the node.",
+    },
+    {
+        .ml_name = "child",
+        .ml_meth = (PyCFunction)node_child,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "child(index)\n--\n\n\
+			   Get child at the given index.",
+    },
+    {
+        .ml_name = "named_child",
+        .ml_meth = (PyCFunction)node_named_child,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "named_child(index)\n--\n\n\
+			   Get named child by index.",
     },
     {
         .ml_name = "child_by_field_id",
@@ -481,34 +746,74 @@ static PyMethodDef node_methods[] = {
         .ml_meth = (PyCFunction)node_children_by_field_id,
         .ml_flags = METH_VARARGS,
         .ml_doc = "children_by_field_id(id)\n--\n\n\
-               Get list of child nodes by the field id.",
+               Get a list of child nodes for the given field id.",
     },
     {
         .ml_name = "children_by_field_name",
         .ml_meth = (PyCFunction)node_children_by_field_name,
         .ml_flags = METH_VARARGS,
         .ml_doc = "children_by_field_name(name)\n--\n\n\
-               Get list of child nodes by the field name.",
+               Get a list of child nodes for the given field name.",
     },
     {.ml_name = "field_name_for_child",
      .ml_meth = (PyCFunction)node_field_name_for_child,
      .ml_flags = METH_VARARGS,
      .ml_doc = "field_name_for_child(index)\n-\n\n\
                Get the field name of a child node by the index of child."},
+    {
+        .ml_name = "descendant_for_byte_range",
+        .ml_meth = (PyCFunction)node_descendant_for_byte_range,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "descendant_for_byte_range(start_byte, end_byte)\n--\n\n\
+			   Get the smallest node within this node that spans the given byte range.",
+    },
+    {
+        .ml_name = "named_descendant_for_byte_range",
+        .ml_meth = (PyCFunction)node_named_descendant_for_byte_range,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "named_descendant_for_byte_range(start_byte, end_byte)\n--\n\n\
+			   Get the smallest named node within this node that spans the given byte range.",
+    },
+    {
+        .ml_name = "descendant_for_point_range",
+        .ml_meth = (PyCFunction)node_descendant_for_point_range,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "descendant_for_point_range(start_point, end_point)\n--\n\n\
+			   Get the smallest node within this node that spans the given point range.",
+    },
+    {
+        .ml_name = "named_descendant_for_point_range",
+        .ml_meth = (PyCFunction)node_named_descendant_for_point_range,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "named_descendant_for_point_range(start_point, end_point)\n--\n\n\
+			   Get the smallest named node within this node that spans the given point range.",
+    },
     {NULL},
 };
 
 static PyGetSetDef node_accessors[] = {
     {"id", (getter)node_get_id, NULL, "The node's numeric id", NULL},
+    {"kind_id", (getter)node_get_kind_id, NULL, "The node's type as a numerical id", NULL},
+    {"grammar_id", (getter)node_get_grammar_id, NULL, "The node's grammar type as a numerical id",
+     NULL},
+    {"grammar_name", (getter)node_get_grammar_name, NULL, "The node's grammar name as a string",
+     NULL},
     {"type", (getter)node_get_type, NULL, "The node's type", NULL},
     {"is_named", (getter)node_get_is_named, NULL, "Is this a named node", NULL},
-    {"is_missing", (getter)node_get_is_missing, NULL, "Is this a node inserted by the parser",
-     NULL},
+    {"is_extra", (getter)node_get_is_extra, NULL, "Is this an extra node", NULL},
     {"has_changes", (getter)node_get_has_changes, NULL,
      "Does this node have text changes since it was parsed", NULL},
     {"has_error", (getter)node_get_has_error, NULL, "Does this node contain any errors", NULL},
+    {"is_error", (getter)node_get_is_error, NULL, "Is this node an error", NULL},
+    {"parse_state", (getter)node_get_parse_state, NULL, "The node's parse state", NULL},
+    {"next_parse_state", (getter)node_get_next_parse_state, NULL,
+     "The parse state after this node's", NULL},
+    {"is_missing", (getter)node_get_is_missing, NULL, "Is this a node inserted by the parser",
+     NULL},
     {"start_byte", (getter)node_get_start_byte, NULL, "The node's start byte", NULL},
     {"end_byte", (getter)node_get_end_byte, NULL, "The node's end byte", NULL},
+    {"byte_range", (getter)node_get_byte_range, NULL, "The node's byte range", NULL},
+    {"range", (getter)node_get_range, NULL, "The node's range", NULL},
     {"start_point", (getter)node_get_start_point, NULL, "The node's start point", NULL},
     {"end_point", (getter)node_get_end_point, NULL, "The node's end point", NULL},
     {"children", (getter)node_get_children, NULL, "The node's children", NULL},
@@ -516,13 +821,15 @@ static PyGetSetDef node_accessors[] = {
     {"named_children", (getter)node_get_named_children, NULL, "The node's named children", NULL},
     {"named_child_count", (getter)node_get_named_child_count, NULL,
      "The number of named children for a node", NULL},
+    {"parent", (getter)node_get_parent, NULL, "The node's parent", NULL},
     {"next_sibling", (getter)node_get_next_sibling, NULL, "The node's next sibling", NULL},
     {"prev_sibling", (getter)node_get_prev_sibling, NULL, "The node's previous sibling", NULL},
     {"next_named_sibling", (getter)node_get_next_named_sibling, NULL,
      "The node's next named sibling", NULL},
     {"prev_named_sibling", (getter)node_get_prev_named_sibling, NULL,
      "The node's previous named sibling", NULL},
-    {"parent", (getter)node_get_parent, NULL, "The node's parent", NULL},
+    {"descendant_count", (getter)node_get_descendant_count, NULL,
+     "The number of descendants for a node, including itself", NULL},
     {"text", (getter)node_get_text, NULL, "The node's text, if tree has not been edited", NULL},
     {NULL},
 };
@@ -562,8 +869,6 @@ static bool node_is_instance(ModuleState *state, PyObject *self) {
 
 // Tree
 
-static PyObject *range_new_internal(ModuleState *state, TSRange range);
-
 static void tree_dealloc(Tree *self) {
     ts_tree_delete(self->tree);
     Py_XDECREF(self->source);
@@ -582,6 +887,21 @@ static PyObject *tree_get_text(Tree *self, void *payload) {
     }
     Py_INCREF(source);
     return source;
+}
+
+static PyObject *tree_root_node_with_offset(Tree *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+
+    unsigned offset_bytes;
+    TSPoint offset_extent;
+
+    if (!PyArg_ParseTuple(args, "I(ii)", &offset_bytes, &offset_extent.row,
+                          &offset_extent.column)) {
+        return NULL;
+    }
+
+    TSNode node = ts_tree_root_node_with_offset(self->tree, offset_bytes, offset_extent);
+    return node_new_internal(state, node, (PyObject *)self);
 }
 
 static PyObject *tree_walk(Tree *self, PyObject *args) {
@@ -620,13 +940,14 @@ static PyObject *tree_edit(Tree *self, PyObject *args, PyObject *kwargs) {
     Py_RETURN_NONE;
 }
 
-static PyObject *tree_get_changed_ranges(Tree *self, PyObject *args, PyObject *kwargs) {
+static PyObject *tree_changed_ranges(Tree *self, PyObject *args, PyObject *kwargs) {
     ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
     Tree *new_tree = NULL;
     char *keywords[] = {"new_tree", NULL};
     int ok = PyArg_ParseTupleAndKeywords(args, kwargs, "O", keywords, (PyObject **)&new_tree);
-    if (!ok)
+    if (!ok) {
         return NULL;
+    }
 
     if (!PyObject_IsInstance((PyObject *)new_tree, (PyObject *)state->tree_type)) {
         PyErr_SetString(PyExc_TypeError, "First argument to get_changed_ranges must be a Tree");
@@ -637,8 +958,27 @@ static PyObject *tree_get_changed_ranges(Tree *self, PyObject *args, PyObject *k
     TSRange *ranges = ts_tree_get_changed_ranges(self->tree, new_tree->tree, &length);
 
     PyObject *result = PyList_New(length);
-    if (!result)
+    if (!result) {
         return NULL;
+    }
+    for (unsigned i = 0; i < length; i++) {
+        PyObject *range = range_new_internal(state, ranges[i]);
+        PyList_SetItem(result, i, range);
+    }
+
+    free(ranges);
+    return result;
+}
+
+static PyObject *tree_get_included_ranges(Tree *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    uint32_t length = 0;
+    TSRange *ranges = ts_tree_included_ranges(self->tree, &length);
+
+    PyObject *result = PyList_New(length);
+    if (!result) {
+        return NULL;
+    }
     for (unsigned i = 0; i < length; i++) {
         PyObject *range = range_new_internal(state, ranges[i]);
         PyList_SetItem(result, i, range);
@@ -649,6 +989,13 @@ static PyObject *tree_get_changed_ranges(Tree *self, PyObject *args, PyObject *k
 }
 
 static PyMethodDef tree_methods[] = {
+    {
+        .ml_name = "root_node_with_offset",
+        .ml_meth = (PyCFunction)tree_root_node_with_offset,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "root_node_with_offset(offset_bytes, offset_extent)\n--\n\n\
+			   Get the root node of the syntax tree, but with its position shifted forward by the given offset.",
+    },
     {
         .ml_name = "walk",
         .ml_meth = (PyCFunction)tree_walk,
@@ -665,10 +1012,10 @@ static PyMethodDef tree_methods[] = {
                Edit the syntax tree.",
     },
     {
-        .ml_name = "get_changed_ranges",
-        .ml_meth = (PyCFunction)tree_get_changed_ranges,
+        .ml_name = "changed_ranges",
+        .ml_meth = (PyCFunction)tree_changed_ranges,
         .ml_flags = METH_KEYWORDS | METH_VARARGS,
-        .ml_doc = "get_changed_ranges(new_tree)\n--\n\n\
+        .ml_doc = "changed_ranges(new_tree)\n--\n\n\
                Compare old edited tree to new tree and return changed ranges.",
     },
     {NULL},
@@ -677,6 +1024,8 @@ static PyMethodDef tree_methods[] = {
 static PyGetSetDef tree_accessors[] = {
     {"root_node", (getter)tree_get_root_node, NULL, "The root node of this tree.", NULL},
     {"text", (getter)tree_get_text, NULL, "The source text for this tree, if unedited.", NULL},
+    {"included_ranges", (getter)tree_get_included_ranges, NULL,
+     "Get the included ranges that were used to parse the syntax tree.", NULL},
     {NULL},
 };
 
@@ -699,8 +1048,9 @@ static PyType_Spec tree_type_spec = {
 static PyObject *tree_new_internal(ModuleState *state, TSTree *tree, PyObject *source,
                                    int keep_text) {
     Tree *self = (Tree *)state->tree_type->tp_alloc(state->tree_type, 0);
-    if (self != NULL)
+    if (self != NULL) {
         self->tree = tree;
+    }
 
     if (keep_text) {
         self->source = source;
@@ -731,6 +1081,14 @@ static PyObject *tree_cursor_get_node(TreeCursor *self, void *payload) {
     return self->node;
 }
 
+static PyObject *tree_cursor_current_field_id(TreeCursor *self, PyObject *args) {
+    uint32_t field_id = ts_tree_cursor_current_field_id(&self->cursor);
+    if (field_id == 0) {
+        Py_RETURN_NONE;
+    }
+    return PyLong_FromUnsignedLong(field_id);
+}
+
 static PyObject *tree_cursor_current_field_name(TreeCursor *self, PyObject *args) {
     const char *field_name = ts_tree_cursor_current_field_name(&self->cursor);
     if (field_name == NULL) {
@@ -739,8 +1097,18 @@ static PyObject *tree_cursor_current_field_name(TreeCursor *self, PyObject *args
     return PyUnicode_FromString(field_name);
 }
 
-static PyObject *tree_cursor_goto_parent(TreeCursor *self, PyObject *args) {
-    bool result = ts_tree_cursor_goto_parent(&self->cursor);
+static PyObject *tree_cursor_current_depth(TreeCursor *self, PyObject *args) {
+    uint32_t depth = ts_tree_cursor_current_depth(&self->cursor);
+    return PyLong_FromUnsignedLong(depth);
+}
+
+static PyObject *tree_cursor_current_descendant_index(TreeCursor *self, PyObject *args) {
+    uint32_t index = ts_tree_cursor_current_descendant_index(&self->cursor);
+    return PyLong_FromUnsignedLong(index);
+}
+
+static PyObject *tree_cursor_goto_first_child(TreeCursor *self, PyObject *args) {
+    bool result = ts_tree_cursor_goto_first_child(&self->cursor);
     if (result) {
         Py_XDECREF(self->node);
         self->node = NULL;
@@ -748,8 +1116,17 @@ static PyObject *tree_cursor_goto_parent(TreeCursor *self, PyObject *args) {
     return PyBool_FromLong(result);
 }
 
-static PyObject *tree_cursor_goto_first_child(TreeCursor *self, PyObject *args) {
-    bool result = ts_tree_cursor_goto_first_child(&self->cursor);
+static PyObject *tree_cursor_goto_last_child(TreeCursor *self, PyObject *args) {
+    bool result = ts_tree_cursor_goto_last_child(&self->cursor);
+    if (result) {
+        Py_XDECREF(self->node);
+        self->node = NULL;
+    }
+    return PyBool_FromLong(result);
+}
+
+static PyObject *tree_cursor_goto_parent(TreeCursor *self, PyObject *args) {
+    bool result = ts_tree_cursor_goto_parent(&self->cursor);
     if (result) {
         Py_XDECREF(self->node);
         self->node = NULL;
@@ -766,33 +1143,122 @@ static PyObject *tree_cursor_goto_next_sibling(TreeCursor *self, PyObject *args)
     return PyBool_FromLong(result);
 }
 
+static PyObject *tree_cursor_goto_previous_sibling(TreeCursor *self, PyObject *args) {
+    bool result = ts_tree_cursor_goto_previous_sibling(&self->cursor);
+    if (result) {
+        Py_XDECREF(self->node);
+        self->node = NULL;
+    }
+    return PyBool_FromLong(result);
+}
+
+static PyObject *tree_cursor_goto_descendant(TreeCursor *self, PyObject *args) {
+    uint32_t index;
+    if (!PyArg_ParseTuple(args, "I", &index)) {
+        return NULL;
+    }
+    ts_tree_cursor_goto_descendant(&self->cursor, index);
+    Py_XDECREF(self->node);
+    self->node = NULL;
+    Py_RETURN_NONE;
+}
+
+static PyObject *tree_cursor_goto_first_child_for_byte(TreeCursor *self, PyObject *args) {
+    uint32_t byte;
+    if (!PyArg_ParseTuple(args, "I", &byte)) {
+        return NULL;
+    }
+    bool result = ts_tree_cursor_goto_first_child_for_byte(&self->cursor, byte);
+    if (result) {
+        Py_XDECREF(self->node);
+        self->node = NULL;
+    }
+    return PyBool_FromLong(result);
+}
+
+static PyObject *tree_cursor_goto_first_child_for_point(TreeCursor *self, PyObject *args) {
+    uint32_t row, column;
+    if (!PyArg_ParseTuple(args, "II", &row, &column)) {
+        return NULL;
+    }
+    bool result = ts_tree_cursor_goto_first_child_for_point(&self->cursor, (TSPoint){row, column});
+    if (result) {
+        Py_XDECREF(self->node);
+        self->node = NULL;
+    }
+    return PyBool_FromLong(result);
+}
+
+static PyObject *tree_cursor_reset(TreeCursor *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    PyObject *node_obj = NULL;
+    if (!PyArg_ParseTuple(args, "O", &node_obj)) {
+        return NULL;
+    }
+    if (!PyObject_IsInstance(node_obj, (PyObject *)state->node_type)) {
+        PyErr_SetString(PyExc_TypeError, "First argument to reset must be a Node");
+        return NULL;
+    }
+    Node *node = (Node *)node_obj;
+    ts_tree_cursor_reset(&self->cursor, node->node);
+    Py_XDECREF(self->node);
+    self->node = NULL;
+    Py_RETURN_NONE;
+}
+
+// Reset to another cursor
+static PyObject *tree_cursor_reset_to(TreeCursor *self, PyObject *args) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    PyObject *cursor_obj = NULL;
+    if (!PyArg_ParseTuple(args, "O", &cursor_obj)) {
+        return NULL;
+    }
+    if (!PyObject_IsInstance(cursor_obj, (PyObject *)state->tree_cursor_type)) {
+        PyErr_SetString(PyExc_TypeError, "First argument to reset_to must be a TreeCursor");
+        return NULL;
+    }
+    TreeCursor *cursor = (TreeCursor *)cursor_obj;
+    ts_tree_cursor_reset_to(&self->cursor, &cursor->cursor);
+    Py_XDECREF(self->node);
+    self->node = NULL;
+    Py_RETURN_NONE;
+}
+
 static PyObject *tree_cursor_copy(PyObject *self);
 
 static PyMethodDef tree_cursor_methods[] = {
     {
-        .ml_name = "current_field_name",
-        .ml_meth = (PyCFunction)tree_cursor_current_field_name,
+        .ml_name = "descendant_index",
+        .ml_meth = (PyCFunction)tree_cursor_current_descendant_index,
         .ml_flags = METH_NOARGS,
-        .ml_doc = "current_field_name()\n--\n\n\
-               Get the field name of the tree cursor's current node.\n\n\
-               If the current node has the field name, return str. Otherwise, return None.",
-    },
-    {
-        .ml_name = "goto_parent",
-        .ml_meth = (PyCFunction)tree_cursor_goto_parent,
-        .ml_flags = METH_NOARGS,
-        .ml_doc = "goto_parent()\n--\n\n\
-               Go to parent.\n\n\
-               If the current node is not the root, move to its parent and\n\
-               return True. Otherwise, return False.",
+        .ml_doc = "current_descendant_index()\n--\n\n\
+			   Get the index of the cursor's current node out of all of the descendants of the original node.",
     },
     {
         .ml_name = "goto_first_child",
         .ml_meth = (PyCFunction)tree_cursor_goto_first_child,
         .ml_flags = METH_NOARGS,
         .ml_doc = "goto_first_child()\n--\n\n\
-               Go to first child.\n\n\
+               Go to the first child.\n\n\
                If the current node has children, move to the first child and\n\
+               return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_last_child",
+        .ml_meth = (PyCFunction)tree_cursor_goto_last_child,
+        .ml_flags = METH_NOARGS,
+        .ml_doc = "goto_last_child()\n--\n\n\
+			   Go to the last child.\n\n\
+			   If the current node has children, move to the last child and\n\
+			   return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_parent",
+        .ml_meth = (PyCFunction)tree_cursor_goto_parent,
+        .ml_flags = METH_NOARGS,
+        .ml_doc = "goto_parent()\n--\n\n\
+               Go to the parent.\n\n\
+               If the current node is not the root, move to its parent and\n\
                return True. Otherwise, return False.",
     },
     {
@@ -800,22 +1266,99 @@ static PyMethodDef tree_cursor_methods[] = {
         .ml_meth = (PyCFunction)tree_cursor_goto_next_sibling,
         .ml_flags = METH_NOARGS,
         .ml_doc = "goto_next_sibling()\n--\n\n\
-               Go to next sibling.\n\n\
+               Go to the next sibling.\n\n\
                If the current node has a next sibling, move to the next sibling\n\
                and return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_previous_sibling",
+        .ml_meth = (PyCFunction)tree_cursor_goto_previous_sibling,
+        .ml_flags = METH_NOARGS,
+        .ml_doc = "goto_previous_sibling()\n--\n\n\
+			   Go to the previous sibling.\n\n\
+			   If the current node has a previous sibling, move to the previous sibling\n\
+			   and return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_descendant",
+        .ml_meth = (PyCFunction)tree_cursor_goto_descendant,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "goto_descendant(index)\n--\n\n\
+			   Go to the descendant at the given index.\n\n\
+			   If the current node has a descendant at the given index, move to the\n\
+			   descendant and return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_first_child_for_byte",
+        .ml_meth = (PyCFunction)tree_cursor_goto_first_child_for_byte,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "goto_first_child_for_byte(byte)\n--\n\n\
+			   Go to the first child that extends beyond the given byte.\n\n\
+			   If the current node has a child that includes the given byte, move to the\n\
+			   child and return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "goto_first_child_for_point",
+        .ml_meth = (PyCFunction)tree_cursor_goto_first_child_for_point,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "goto_first_child_for_point(row, column)\n--\n\n\
+			   Go to the first child that extends beyond the given point.\n\n\
+			   If the current node has a child that includes the given point, move to the\n\
+			   child and return True. Otherwise, return False.",
+    },
+    {
+        .ml_name = "reset",
+        .ml_meth = (PyCFunction)tree_cursor_reset,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "reset(node)\n--\n\n\
+			   Re-initialize a tree cursor to start at a different node.",
+    },
+    {
+        .ml_name = "reset_to",
+        .ml_meth = (PyCFunction)tree_cursor_reset_to,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "reset_to(cursor)\n--\n\n\
+			   Re-initialize the cursor to the same position as the given cursor.\n\n\
+			   Unlike `reset`, this will not lose parent information and allows reusing already created cursors\n`",
     },
     {
         .ml_name = "copy",
         .ml_meth = (PyCFunction)tree_cursor_copy,
         .ml_flags = METH_NOARGS,
         .ml_doc = "copy()\n--\n\n\
-               Make a independent copy of this cursor.\n",
+               Create an independent copy of the cursor.\n",
     },
     {NULL},
 };
 
 static PyGetSetDef tree_cursor_accessors[] = {
     {"node", (getter)tree_cursor_get_node, NULL, "The current node.", NULL},
+    {
+        "field_id",
+        (getter)tree_cursor_current_field_id,
+        NULL,
+        "current_field_id()\n--\n\n\
+			   Get the field id of the tree cursor's current node.\n\n\
+			   If the current node has the field id, return int. Otherwise, return None.",
+        NULL,
+    },
+    {
+        "field_name",
+        (getter)tree_cursor_current_field_name,
+        NULL,
+        "current_field_name()\n--\n\n\
+               Get the field name of the tree cursor's current node.\n\n\
+               If the current node has the field name, return str. Otherwise, return None.",
+        NULL,
+    },
+    {
+        "depth",
+        (getter)tree_cursor_current_depth,
+        NULL,
+        "current_depth()\n--\n\n\
+			   Get the depth of the cursor's current node relative to the original node.",
+        NULL,
+    },
     {NULL},
 };
 
@@ -863,8 +1406,9 @@ static PyObject *tree_cursor_copy(PyObject *self) {
 
 static PyObject *parser_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     Parser *self = (Parser *)type->tp_alloc(type, 0);
-    if (self != NULL)
+    if (self != NULL) {
         self->parser = ts_parser_new();
+    }
     return (PyObject *)self;
 }
 
@@ -988,6 +1532,71 @@ static PyObject *parser_parse(Parser *self, PyObject *args, PyObject *kwargs) {
     return tree_new_internal(state, new_tree, source_or_callback, keep_text);
 }
 
+static PyObject *parser_reset(Parser *self, void *payload) {
+    ts_parser_reset(self->parser);
+    Py_RETURN_NONE;
+}
+
+static PyObject *parser_get_timeout_micros(Parser *self, void *payload) {
+    return PyLong_FromUnsignedLong(ts_parser_timeout_micros(self->parser));
+}
+
+static PyObject *parser_set_timeout_micros(Parser *self, PyObject *arg) {
+    long timeout;
+    if (!PyArg_Parse(arg, "l", &timeout)) {
+        return NULL;
+    }
+
+    if (timeout < 0) {
+        PyErr_SetString(PyExc_ValueError, "Timeout must be a positive integer");
+        return NULL;
+    }
+
+    ts_parser_set_timeout_micros(self->parser, timeout);
+    Py_RETURN_NONE;
+}
+
+static PyObject *parser_set_included_ranges(Parser *self, PyObject *arg) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    PyObject *ranges = NULL;
+    if (!PyArg_Parse(arg, "O", &ranges)) {
+        return NULL;
+    }
+
+    if (!PyList_Check(ranges)) {
+        PyErr_SetString(PyExc_TypeError, "Included ranges must be a list");
+        return NULL;
+    }
+
+    uint32_t length = PyList_Size(ranges);
+    TSRange *c_ranges = malloc(sizeof(TSRange) * length);
+    if (!c_ranges) {
+        PyErr_SetString(PyExc_MemoryError, "Out of memory");
+        return NULL;
+    }
+
+    for (unsigned i = 0; i < length; i++) {
+        PyObject *range = PyList_GetItem(ranges, i);
+        if (!PyObject_IsInstance(range, (PyObject *)state->range_type)) {
+            PyErr_SetString(PyExc_TypeError, "Included range must be a Range");
+            free(c_ranges);
+            return NULL;
+        }
+        c_ranges[i] = ((Range *)range)->range;
+    }
+
+    bool res = ts_parser_set_included_ranges(self->parser, c_ranges, length);
+    if (!res) {
+        PyErr_SetString(PyExc_ValueError,
+                        "Included ranges must not overlap or end before it starts");
+        free(c_ranges);
+        return NULL;
+    }
+
+    free(c_ranges);
+    Py_RETURN_NONE;
+}
+
 static PyObject *parser_set_language(Parser *self, PyObject *arg) {
     PyObject *language_id = PyObject_GetAttrString(arg, "language_id");
     if (!language_id) {
@@ -1019,6 +1628,12 @@ static PyObject *parser_set_language(Parser *self, PyObject *arg) {
     Py_RETURN_NONE;
 }
 
+static PyGetSetDef parser_accessors[] = {
+    {"timeout_micros", (getter)parser_get_timeout_micros, NULL,
+     "The timeout for parsing, in microseconds.", NULL},
+    {NULL},
+};
+
 static PyMethodDef parser_methods[] = {
     {
         .ml_name = "parse",
@@ -1026,6 +1641,28 @@ static PyMethodDef parser_methods[] = {
         .ml_flags = METH_VARARGS | METH_KEYWORDS,
         .ml_doc = "parse(bytes, old_tree=None, keep_text=True)\n--\n\n\
                Parse source code, creating a syntax tree.",
+    },
+    {
+        .ml_name = "reset",
+        .ml_meth = (PyCFunction)parser_reset,
+        .ml_flags = METH_NOARGS,
+        .ml_doc = "reset()\n--\n\n\
+			   Instruct the parser to start the next parse from the beginning.",
+    },
+    {
+        .ml_name = "set_timeout_micros",
+        .ml_meth = (PyCFunction)parser_set_timeout_micros,
+        .ml_flags = METH_O,
+        .ml_doc = "set_timeout_micros(timeout_micros)\n--\n\n\
+			  Set the maximum duration in microseconds that parsing should be allowed to\
+              take before halting.",
+    },
+    {
+        .ml_name = "set_included_ranges",
+        .ml_meth = (PyCFunction)parser_set_included_ranges,
+        .ml_flags = METH_O,
+        .ml_doc = "set_included_ranges(ranges)\n--\n\n\
+			   Set the ranges of text that the parser should include when parsing.",
     },
     {
         .ml_name = "set_language",
@@ -1167,8 +1804,9 @@ static PyObject *capture_match_string_new_internal(ModuleState *state, uint32_t 
                                                    const char *string_value, int is_positive) {
     CaptureMatchString *self = (CaptureMatchString *)state->capture_match_string_type->tp_alloc(
         state->capture_match_string_type, 0);
-    if (self == NULL)
+    if (self == NULL) {
         return NULL;
+    }
     self->capture_value_id = capture_value_id;
     self->regex = PyObject_CallFunction(state->re_compile, "s", string_value);
     self->is_positive = is_positive;
@@ -1231,54 +1869,64 @@ static bool satisfies_text_predicates(Query *query, TSQueryMatch match, Tree *tr
             uint32_t capture2_value_id = ((CaptureEqCapture *)text_predicate)->capture2_value_id;
             node1 = node_for_capture_index(state, capture1_value_id, match, tree);
             node2 = node_for_capture_index(state, capture2_value_id, match, tree);
-            if (node1 == NULL || node2 == NULL)
+            if (node1 == NULL || node2 == NULL) {
                 goto error;
+            }
             node1_text = node_get_text(node1, NULL);
             node2_text = node_get_text(node2, NULL);
-            if (node1_text == NULL || node2_text == NULL)
+            if (node1_text == NULL || node2_text == NULL) {
                 goto error;
+            }
             Py_XDECREF(node1);
             Py_XDECREF(node2);
             is_satisfied = PyObject_RichCompareBool(node1_text, node2_text, Py_EQ) ==
                            ((CaptureEqCapture *)text_predicate)->is_positive;
             Py_XDECREF(node1_text);
             Py_XDECREF(node2_text);
-            if (!is_satisfied)
+            if (!is_satisfied) {
                 return false;
+            }
         } else if (capture_eq_string_is_instance(text_predicate)) {
             uint32_t capture_value_id = ((CaptureEqString *)text_predicate)->capture_value_id;
             node1 = node_for_capture_index(state, capture_value_id, match, tree);
-            if (node1 == NULL)
+            if (node1 == NULL) {
                 goto error;
+            }
             node1_text = node_get_text(node1, NULL);
-            if (node1_text == NULL)
+            if (node1_text == NULL) {
                 goto error;
+            }
             Py_XDECREF(node1);
             PyObject *string_value = ((CaptureEqString *)text_predicate)->string_value;
             is_satisfied = PyObject_RichCompareBool(node1_text, string_value, Py_EQ) ==
                            ((CaptureEqString *)text_predicate)->is_positive;
             Py_XDECREF(node1_text);
-            if (!is_satisfied)
+            if (!is_satisfied) {
                 return false;
+            }
         } else if (capture_match_string_is_instance(text_predicate)) {
             uint32_t capture_value_id = ((CaptureMatchString *)text_predicate)->capture_value_id;
             node1 = node_for_capture_index(state, capture_value_id, match, tree);
-            if (node1 == NULL)
+            if (node1 == NULL) {
                 goto error;
+            }
             node1_text = node_get_text(node1, NULL);
-            if (node1_text == NULL)
+            if (node1_text == NULL) {
                 goto error;
+            }
             Py_XDECREF(node1);
             PyObject *search_result =
                 PyObject_CallMethod(((CaptureMatchString *)text_predicate)->regex, "search", "s",
                                     PyBytes_AsString(node1_text));
             Py_XDECREF(node1_text);
-            is_satisfied =
-                (search_result != NULL && search_result != Py_None) == ((CaptureMatchString *)text_predicate)->is_positive;
-            if (search_result != NULL)
-              Py_DECREF(search_result);
-            if (!is_satisfied)
+            is_satisfied = (search_result != NULL && search_result != Py_None) ==
+                           ((CaptureMatchString *)text_predicate)->is_positive;
+            if (search_result != NULL) {
+                Py_DECREF(search_result);
+            }
+            if (!is_satisfied) {
                 return false;
+            }
         }
     }
     return true;
@@ -1305,8 +1953,9 @@ static PyObject *query_captures(Query *self, PyObject *args, PyObject *kwargs) {
     int ok = PyArg_ParseTupleAndKeywords(args, kwargs, "O|(II)(II)II", keywords, (PyObject **)&node,
                                          &start_point.row, &start_point.column, &end_point.row,
                                          &end_point.column, &start_byte, &end_byte);
-    if (!ok)
+    if (!ok) {
         return NULL;
+    }
 
     if (!PyObject_IsInstance((PyObject *)node, (PyObject *)state->node_type)) {
         PyErr_SetString(PyExc_TypeError, "First argument to captures must be a Node");
@@ -1319,21 +1968,24 @@ static PyObject *query_captures(Query *self, PyObject *args, PyObject *kwargs) {
 
     QueryCapture *capture = NULL;
     PyObject *result = PyList_New(0);
-    if (result == NULL)
+    if (result == NULL) {
         goto error;
+    }
 
     uint32_t capture_index;
     TSQueryMatch match;
     while (ts_query_cursor_next_capture(state->query_cursor, &match, &capture_index)) {
         capture = (QueryCapture *)query_capture_new_internal(state, match.captures[capture_index]);
-        if (capture == NULL)
+        if (capture == NULL) {
             goto error;
+        }
         if (satisfies_text_predicates(self, match, (Tree *)node->tree)) {
             PyObject *capture_name = PyList_GetItem(self->capture_names, capture->capture.index);
             PyObject *capture_node = node_new_internal(state, capture->capture.node, node->tree);
             PyObject *item = PyTuple_Pack(2, capture_node, capture_name);
-            if (item == NULL)
+            if (item == NULL) {
                 goto error;
+            }
             Py_XDECREF(capture_node);
             PyList_Append(result, item);
             Py_XDECREF(item);
@@ -1349,8 +2001,9 @@ error:
 }
 
 static void query_dealloc(Query *self) {
-    if (self->query)
+    if (self->query) {
         ts_query_delete(self->query);
+    }
     Py_XDECREF(self->capture_names);
     Py_XDECREF(self->text_predicates);
     Py_TYPE(self)->tp_free(self);
@@ -1390,8 +2043,9 @@ static PyType_Spec query_type_spec = {
 static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, char *source,
                                     int length) {
     Query *query = (Query *)state->query_type->tp_alloc(state->query_type, 0);
-    if (query == NULL)
+    if (query == NULL) {
         return NULL;
+    }
 
     PyObject *pattern_text_predicates = NULL;
     uint32_t error_offset;
@@ -1402,8 +2056,9 @@ static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, ch
         char *word_end = word_start;
         while (word_end < &source[length] &&
                (iswalnum(*word_end) || *word_end == '-' || *word_end == '_' || *word_end == '?' ||
-                *word_end == '.'))
+                *word_end == '.')) {
             word_end++;
+        }
         char c = *word_end;
         *word_end = 0;
         switch (error_type) {
@@ -1434,20 +2089,23 @@ static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, ch
 
     unsigned pattern_count = ts_query_pattern_count(query->query);
     query->text_predicates = PyList_New(pattern_count);
-    if (query->text_predicates == NULL)
+    if (query->text_predicates == NULL) {
         goto error;
+    }
 
     for (unsigned i = 0; i < pattern_count; i++) {
         unsigned length;
         const TSQueryPredicateStep *predicate_step =
             ts_query_predicates_for_pattern(query->query, i, &length);
         pattern_text_predicates = PyList_New(0);
-        if (pattern_text_predicates == NULL)
+        if (pattern_text_predicates == NULL) {
             goto error;
+        }
         for (unsigned j = 0; j < length; j++) {
             unsigned predicate_len = 0;
-            while ((predicate_step + predicate_len)->type != TSQueryPredicateStepTypeDone)
+            while ((predicate_step + predicate_len)->type != TSQueryPredicateStepTypeDone) {
                 predicate_len++;
+            }
 
             if (predicate_step->type != TSQueryPredicateStepTypeString) {
                 PyErr_Format(
@@ -1482,8 +2140,9 @@ static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, ch
                         (CaptureEqCapture *)capture_eq_capture_new_internal(
                             state, predicate_step[1].value_id, predicate_step[2].value_id,
                             is_positive);
-                    if (capture_eq_capture_predicate == NULL)
+                    if (capture_eq_capture_predicate == NULL) {
                         goto error;
+                    }
                     PyList_Append(pattern_text_predicates,
                                   (PyObject *)capture_eq_capture_predicate);
                     Py_DECREF(capture_eq_capture_predicate);
@@ -1494,8 +2153,9 @@ static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, ch
                     CaptureEqString *capture_eq_string_predicate =
                         (CaptureEqString *)capture_eq_string_new_internal(
                             state, predicate_step[1].value_id, string_value, is_positive);
-                    if (capture_eq_string_predicate == NULL)
+                    if (capture_eq_string_predicate == NULL) {
                         goto error;
+                    }
                     PyList_Append(pattern_text_predicates, (PyObject *)capture_eq_string_predicate);
                     Py_DECREF(capture_eq_string_predicate);
                     break;
@@ -1530,8 +2190,9 @@ static PyObject *query_new_internal(ModuleState *state, TSLanguage *language, ch
                 CaptureMatchString *capture_match_string_predicate =
                     (CaptureMatchString *)capture_match_string_new_internal(
                         state, predicate_step[1].value_id, string_value, is_positive);
-                if (capture_match_string_predicate == NULL)
+                if (capture_match_string_predicate == NULL) {
                     goto error;
+                }
                 PyList_Append(pattern_text_predicates, (PyObject *)capture_match_string_predicate);
                 Py_DECREF(capture_match_string_predicate);
             }
@@ -1549,6 +2210,42 @@ error:
 }
 
 // Range
+
+PyMODINIT_FUNC range_init(Range *self, PyObject *args, PyObject *kwargs) {
+    ModuleState *state = PyType_GetModuleState(Py_TYPE(self));
+    char *keywords[] = {
+        "start_point", "end_point", "start_byte", "end_byte", NULL,
+    };
+
+    PyObject *start_point_obj;
+    PyObject *end_point_obj;
+    unsigned start_byte;
+    unsigned end_byte;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O!O!II", keywords, &PyTuple_Type,
+                                     &start_point_obj, &PyTuple_Type, &end_point_obj, &start_byte,
+                                     &end_byte)) {
+        PyErr_SetString(PyExc_TypeError, "Invalid arguments to Range()");
+        return NULL;
+    }
+
+    if (start_point_obj && !PyArg_ParseTuple(start_point_obj, "II", &self->range.start_point.row,
+                                             &self->range.start_point.column)) {
+        PyErr_SetString(PyExc_TypeError, "Invalid start_point to Range()");
+        return NULL;
+    }
+
+    if (end_point_obj && !PyArg_ParseTuple(end_point_obj, "II", &self->range.end_point.row,
+                                           &self->range.end_point.column)) {
+        PyErr_SetString(PyExc_TypeError, "Invalid end_point to Range()");
+        return NULL;
+    }
+
+    self->range.start_byte = start_byte;
+    self->range.end_byte = end_byte;
+
+    return 0;
+}
 
 static void range_dealloc(Range *self) { Py_TYPE(self)->tp_free(self); }
 
@@ -1613,6 +2310,7 @@ static PyGetSetDef range_accessors[] = {
 
 static PyType_Slot range_type_slots[] = {
     {Py_tp_doc, "A range within a document."},
+    {Py_tp_init, range_init},
     {Py_tp_dealloc, range_dealloc},
     {Py_tp_repr, range_repr},
     {Py_tp_richcompare, range_compare},
@@ -1630,12 +2328,318 @@ static PyType_Spec range_type_spec = {
 
 static PyObject *range_new_internal(ModuleState *state, TSRange range) {
     Range *self = (Range *)state->range_type->tp_alloc(state->range_type, 0);
-    if (self != NULL)
+    if (self != NULL) {
         self->range = range;
+    }
     return (PyObject *)self;
 }
 
+// LookaheadIterator
+
+static void lookahead_iterator_dealloc(LookaheadIterator *self) {
+    if (self->lookahead_iterator) {
+        ts_lookahead_iterator_delete(self->lookahead_iterator);
+    }
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyObject *lookahead_iterator_repr(LookaheadIterator *self) {
+    const char *format_string = "<LookaheadIterator %x>";
+    return PyUnicode_FromFormat(format_string, self->lookahead_iterator);
+}
+
+static PyObject *lookahead_iterator_get_language(LookaheadIterator *self, void *payload) {
+    return PyLong_FromVoidPtr((void *)ts_lookahead_iterator_language(self->lookahead_iterator));
+}
+
+static PyObject *lookahead_iterator_get_current_symbol(LookaheadIterator *self, void *payload) {
+    return PyLong_FromSize_t(
+        (size_t)ts_lookahead_iterator_current_symbol(self->lookahead_iterator));
+}
+
+static PyObject *lookahead_iterator_get_current_symbol_name(LookaheadIterator *self,
+                                                            void *payload) {
+    const char *name = ts_lookahead_iterator_current_symbol_name(self->lookahead_iterator);
+    return PyUnicode_FromString(name);
+}
+
+static PyObject *lookahead_iterator_reset(LookaheadIterator *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    uint16_t state_id;
+    if (!PyArg_ParseTuple(args, "OH", &language_id, &state_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyBool_FromLong(
+        ts_lookahead_iterator_reset(self->lookahead_iterator, language, state_id));
+}
+
+static PyObject *lookahead_iterator_reset_state(LookaheadIterator *self, PyObject *args) {
+    uint16_t state_id;
+    if (!PyArg_ParseTuple(args, "H", &state_id)) {
+        return NULL;
+    }
+    return PyBool_FromLong(ts_lookahead_iterator_reset_state(self->lookahead_iterator, state_id));
+}
+
+static PyObject *lookahead_iterator_iter(LookaheadIterator *self) {
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static PyObject *lookahead_iterator_next(LookaheadIterator *self) {
+    bool res = ts_lookahead_iterator_next(self->lookahead_iterator);
+    if (res) {
+        return PyLong_FromSize_t(
+            (size_t)ts_lookahead_iterator_current_symbol(self->lookahead_iterator));
+    }
+    PyErr_SetNone(PyExc_StopIteration);
+    return NULL;
+}
+
+static PyObject *lookahead_iterator_names_iterator(LookaheadIterator *self) {
+    return lookahead_names_iterator_new_internal(PyType_GetModuleState(Py_TYPE(self)),
+                                                 self->lookahead_iterator);
+}
+
+static PyObject *lookahead_iterator(PyObject *self, PyObject *args) {
+    ModuleState *state = PyModule_GetState(self);
+
+    TSLanguage *language;
+    PyObject *language_id;
+    uint16_t state_id;
+    if (!PyArg_ParseTuple(args, "OH", &language_id, &state_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+
+    TSLookaheadIterator *lookahead_iterator = ts_lookahead_iterator_new(language, state_id);
+
+    if (lookahead_iterator == NULL) {
+        Py_RETURN_NONE;
+    }
+
+    return lookahead_iterator_new_internal(state, lookahead_iterator);
+}
+
+static PyObject *lookahead_iterator_new_internal(ModuleState *state,
+                                                 TSLookaheadIterator *lookahead_iterator) {
+    LookaheadIterator *self = (LookaheadIterator *)state->lookahead_iterator_type->tp_alloc(
+        state->lookahead_iterator_type, 0);
+    if (self != NULL) {
+        self->lookahead_iterator = lookahead_iterator;
+    }
+    return (PyObject *)self;
+}
+
+static PyGetSetDef lookahead_iterator_accessors[] = {
+    {"language", (getter)lookahead_iterator_get_language, NULL, "Get the language.", NULL},
+    {"current_symbol", (getter)lookahead_iterator_get_current_symbol, NULL,
+     "Get the current symbol.", NULL},
+    {"current_symbol_name", (getter)lookahead_iterator_get_current_symbol_name, NULL,
+     "Get the current symbol name.", NULL},
+    {NULL},
+};
+
+static PyMethodDef lookahead_iterator_methods[] = {
+    {.ml_name = "reset",
+     .ml_meth = (PyCFunction)lookahead_iterator_reset,
+     .ml_flags = METH_VARARGS,
+     .ml_doc = "reset(language, state)\n--\n\n\
+			  Reset the lookahead iterator to a new language and parse state.\n\
+        	  This returns `True` if the language was set successfully, and `False` otherwise."},
+    {.ml_name = "reset_state",
+     .ml_meth = (PyCFunction)lookahead_iterator_reset_state,
+     .ml_flags = METH_VARARGS,
+     .ml_doc = "reset_state(state)\n--\n\n\
+			  Reset the lookahead iterator to a new parse state.\n\
+			  This returns `True` if the state was set successfully, and `False` otherwise."},
+    {
+        .ml_name = "iter_names",
+        .ml_meth = (PyCFunction)lookahead_iterator_names_iterator,
+        .ml_flags = METH_NOARGS,
+        .ml_doc = "iter_names()\n--\n\n\
+			  Get an iterator of the names of possible syntax nodes that could come next.",
+    },
+    {NULL},
+};
+
+static PyType_Slot lookahead_iterator_type_slots[] = {
+    {Py_tp_doc, "An iterator over the possible syntax nodes that could come next."},
+    {Py_tp_dealloc, lookahead_iterator_dealloc},
+    {Py_tp_repr, lookahead_iterator_repr},
+    {Py_tp_getset, lookahead_iterator_accessors},
+    {Py_tp_methods, lookahead_iterator_methods},
+    {Py_tp_iter, lookahead_iterator_iter},
+    {Py_tp_iternext, lookahead_iterator_next},
+    {0, NULL},
+};
+
+static PyType_Spec lookahead_iterator_type_spec = {
+    .name = "tree_sitter.LookaheadIterator",
+    .basicsize = sizeof(LookaheadIterator),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT,
+    .slots = lookahead_iterator_type_slots,
+};
+
+// LookaheadNamesIterator
+
+static PyObject *lookahead_names_iterator_new_internal(ModuleState *state,
+                                                       TSLookaheadIterator *lookahead_iterator) {
+    LookaheadNamesIterator *self =
+        (LookaheadNamesIterator *)state->lookahead_names_iterator_type->tp_alloc(
+            state->lookahead_names_iterator_type, 0);
+    if (self == NULL) {
+        return NULL;
+    }
+    self->lookahead_iterator = lookahead_iterator;
+    return (PyObject *)self;
+}
+
+static PyObject *lookahead_names_iterator_repr(LookaheadNamesIterator *self) {
+    const char *format_string = "<LookaheadNamesIterator %x>";
+    return PyUnicode_FromFormat(format_string, self->lookahead_iterator);
+}
+
+static void lookahead_names_iterator_dealloc(LookaheadNamesIterator *self) {
+    Py_TYPE(self)->tp_free(self);
+}
+
+static PyObject *lookahead_names_iterator_iter(LookaheadNamesIterator *self) {
+    Py_INCREF(self);
+    return (PyObject *)self;
+}
+
+static PyObject *lookahead_names_iterator_next(LookaheadNamesIterator *self) {
+    bool res = ts_lookahead_iterator_next(self->lookahead_iterator);
+    if (res) {
+        return PyUnicode_FromString(
+            ts_lookahead_iterator_current_symbol_name(self->lookahead_iterator));
+    }
+    PyErr_SetNone(PyExc_StopIteration);
+    return NULL;
+}
+
+static PyType_Slot lookahead_names_iterator_type_slots[] = {
+    {Py_tp_doc, "An iterator over the possible syntax nodes that could come next."},
+    {Py_tp_dealloc, lookahead_names_iterator_dealloc},
+    {Py_tp_repr, lookahead_names_iterator_repr},
+    {Py_tp_iter, lookahead_names_iterator_iter},
+    {Py_tp_iternext, lookahead_names_iterator_next},
+    {0, NULL},
+};
+
+static PyType_Spec lookahead_names_iterator_type_spec = {
+    .name = "tree_sitter.LookaheadNamesIterator",
+    .basicsize = sizeof(LookaheadNamesIterator),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT,
+    .slots = lookahead_names_iterator_type_slots,
+};
+
 // Module
+
+static PyObject *language_version(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    if (!PyArg_ParseTuple(args, "O", &language_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t((size_t)ts_language_version(language));
+}
+
+static PyObject *language_symbol_count(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    if (!PyArg_ParseTuple(args, "O", &language_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t((size_t)ts_language_symbol_count(language));
+}
+
+static PyObject *language_state_count(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    if (!PyArg_ParseTuple(args, "O", &language_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t((size_t)ts_language_state_count(language));
+}
+
+static PyObject *language_symbol_name(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    TSSymbol symbol;
+    if (!PyArg_ParseTuple(args, "OH", &language_id, &symbol)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    const char *name = ts_language_symbol_name(language, symbol);
+    if (name == NULL) {
+        Py_RETURN_NONE;
+    }
+    return PyUnicode_FromString(name);
+}
+
+static PyObject *language_symbol_for_name(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    char *kind;
+    Py_ssize_t length;
+    bool named;
+    if (!PyArg_ParseTuple(args, "Os#p", &language_id, &kind, &length, &named)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    TSSymbol symbol = ts_language_symbol_for_name(language, kind, length, named);
+    if (symbol == 0) {
+        Py_RETURN_NONE;
+    }
+    return PyLong_FromSize_t((size_t)symbol);
+}
+
+static PyObject *language_symbol_type(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    TSSymbol symbol;
+    if (!PyArg_ParseTuple(args, "OH", &language_id, &symbol)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t(ts_language_symbol_type(language, symbol));
+}
+
+static PyObject *language_field_count(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    if (!PyArg_ParseTuple(args, "O", &language_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t(ts_language_field_count(language));
+}
+
+static PyObject *language_field_name_for_id(PyObject *self, PyObject *args) {
+    TSLanguage *language;
+    PyObject *language_id;
+    uint16_t field_id;
+    if (!PyArg_ParseTuple(args, "OH", &language_id, &field_id)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    const char *field_name = ts_language_field_name_for_id(language, field_id);
+
+    if (field_name == NULL) {
+        Py_RETURN_NONE;
+    }
+
+    return PyUnicode_FromString(field_name);
+}
 
 static PyObject *language_field_id_for_name(PyObject *self, PyObject *args) {
     TSLanguage *language;
@@ -1647,8 +2651,8 @@ static PyObject *language_field_id_for_name(PyObject *self, PyObject *args) {
     }
 
     language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
-
     TSFieldId field_id = ts_language_field_id_for_name(language, field_name, length);
+
     if (field_id == 0) {
         Py_RETURN_NONE;
     }
@@ -1669,6 +2673,19 @@ static PyObject *language_query(PyObject *self, PyObject *args) {
     return query_new_internal(state, language, source, length);
 }
 
+static PyObject *next_state(PyObject *self, PyObject *args) {
+    ModuleState *state = PyModule_GetState(self);
+    TSLanguage *language;
+    PyObject *language_id;
+    uint16_t state_id;
+    uint16_t symbol;
+    if (!PyArg_ParseTuple(args, "OHH", &language_id, &state_id, &symbol)) {
+        return NULL;
+    }
+    language = (TSLanguage *)PyLong_AsVoidPtr(language_id);
+    return PyLong_FromSize_t((size_t)ts_language_next_state(language, state_id, symbol));
+}
+
 static void module_free(void *self) {
     ModuleState *state = PyModule_GetState((PyObject *)self);
     ts_query_cursor_delete(state->query_cursor);
@@ -1682,13 +2699,74 @@ static void module_free(void *self) {
     Py_XDECREF(state->capture_eq_capture_type);
     Py_XDECREF(state->capture_eq_string_type);
     Py_XDECREF(state->capture_match_string_type);
+    Py_XDECREF(state->lookahead_iterator_type);
     Py_XDECREF(state->re_compile);
 }
 
 static PyMethodDef module_methods[] = {
     {
+        .ml_name = "_language_version",
+        .ml_meth = (PyCFunction)language_version,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_symbol_count",
+        .ml_meth = (PyCFunction)language_symbol_count,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_state_count",
+        .ml_meth = (PyCFunction)language_state_count,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_symbol_name",
+        .ml_meth = (PyCFunction)language_symbol_name,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_symbol_for_name",
+        .ml_meth = (PyCFunction)language_symbol_for_name,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_symbol_type",
+        .ml_meth = (PyCFunction)language_symbol_type,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_field_count",
+        .ml_meth = (PyCFunction)language_field_count,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_language_field_name_for_id",
+        .ml_meth = (PyCFunction)language_field_name_for_id,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
         .ml_name = "_language_field_id_for_name",
         .ml_meth = (PyCFunction)language_field_id_for_name,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_next_state",
+        .ml_meth = (PyCFunction)next_state,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "(internal)",
+    },
+    {
+        .ml_name = "_lookahead_iterator",
+        .ml_meth = (PyCFunction)lookahead_iterator,
         .ml_flags = METH_VARARGS,
         .ml_doc = "(internal)",
     },
@@ -1746,6 +2824,10 @@ PyMODINIT_FUNC PyInit_binding(void) {
         (PyTypeObject *)PyType_FromModuleAndSpec(module, &capture_eq_string_type_spec, NULL);
     state->capture_match_string_type =
         (PyTypeObject *)PyType_FromModuleAndSpec(module, &capture_match_string_type_spec, NULL);
+    state->lookahead_iterator_type =
+        (PyTypeObject *)PyType_FromModuleAndSpec(module, &lookahead_iterator_type_spec, NULL);
+    state->lookahead_names_iterator_type =
+        (PyTypeObject *)PyType_FromModuleAndSpec(module, &lookahead_names_iterator_type_spec, NULL);
 
     state->query_cursor = ts_query_cursor_new();
     if ((AddObjectRef(module, "Tree", (PyObject *)state->tree_type) < 0) ||
@@ -1759,7 +2841,11 @@ PyMODINIT_FUNC PyInit_binding(void) {
          0) ||
         (AddObjectRef(module, "CaptureEqString", (PyObject *)state->capture_eq_string_type) < 0) ||
         (AddObjectRef(module, "CaptureMatchString", (PyObject *)state->capture_match_string_type) <
-         0)) {
+         0) ||
+        (AddObjectRef(module, "LookaheadIterator", (PyObject *)state->lookahead_iterator_type) <
+         0) ||
+        (AddObjectRef(module, "LookaheadNamesIterator",
+                      (PyObject *)state->lookahead_names_iterator_type) < 0)) {
         goto cleanup;
     }
 

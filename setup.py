@@ -4,15 +4,15 @@ Py-Tree-sitter
 
 from os import path
 from platform import system
-from setuptools import Extension, setup
 
+from setuptools import Extension, setup
 
 with open(path.join(path.dirname(__file__), "README.md")) as f:
     LONG_DESCRIPTION = f.read()
 
 setup(
     name="tree_sitter",
-    version="0.20.1",
+    version="0.20.2",
     maintainer="Max Brunsfeld",
     maintainer_email="maxbrunsfeld@gmail.com",
     author="Max Brunsfeld",
@@ -21,7 +21,7 @@ setup(
     license="MIT",
     platforms=["any"],
     python_requires=">=3.3",
-    description="Python bindings to the Tree-sitter parsing library",
+    description="Python bindings for the Tree-Sitter parsing library",
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
     classifiers=[
@@ -30,6 +30,7 @@ setup(
         "Topic :: Text Processing :: Linguistic",
     ],
     packages=["tree_sitter"],
+    package_data={"tree_sitter": ["py.typed", "*.pyi"]},
     ext_modules=[
         Extension(
             "tree_sitter.binding",
